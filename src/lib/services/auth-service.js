@@ -30,7 +30,7 @@ export class AuthService {
     this.validateUsername(username);
 
     try {
-      // Create auth user
+      // Create auth user with metadata for the database trigger
       const { data: authData, error: authError } = await this.supabase.auth.signUp({
         email,
         password,
@@ -46,37 +46,33 @@ export class AuthService {
         throw new Error(authError.message);
       }
 
-      // Create user profile
+      // The database trigger will automatically create the profile with all data
       if (authData.user) {
         try {
-          const { data: profileData, error: profileError } = await this.supabase
-            .from('profiles')
-            .insert({
-              user_id: authData.user.id,
-              username,
-              full_name: full_name || null,
-              email
-            })
-            .select()
-            .single();
+          // Wait a brief moment for the trigger to complete
+          await new Promise(resolve => setTimeout(resolve, 100));
 
-          if (profileError) {
-            // Handle duplicate username
-            if (profileError.code === '23505' && profileError.message.includes('username')) {
-              throw new Error('Username already taken');
-            }
-            throw new Error(`Profile creation failed: ${profileError.message}`);
+          // Fetch the profile that was created by the trigger
+          const profile = await this.getUserProfile(authData.user.id);
+          
+          if (!profile) {
+            throw new Error('Profile was not created by database trigger');
           }
 
           return {
             user: authData.user,
             session: authData.session,
-            profile: profileData
+            profile
           };
         } catch (profileError) {
-          // If profile creation fails, we should clean up the auth user
-          // In a real implementation, you might want to handle this differently
-          throw profileError;
+          // If we can't fetch the profile, still return the auth data
+          console.error('Profile fetch failed:', profileError);
+          
+          return {
+            user: authData.user,
+            session: authData.session,
+            profile: null
+          };
         }
       }
 
@@ -180,9 +176,9 @@ export class AuthService {
   async getUserProfile(userId) {
     try {
       const { data, error } = await this.supabase
-        .from('profiles')
+        .from('users')
         .select('*')
-        .eq('user_id', userId)
+        .eq('id', userId)
         .single();
 
       if (error) {
@@ -219,12 +215,12 @@ export class AuthService {
 
     try {
       const { data, error } = await this.supabase
-        .from('profiles')
+        .from('users')
         .update({
           ...profileData,
           updated_at: new Date().toISOString()
         })
-        .eq('user_id', userId)
+        .eq('id', userId)
         .select()
         .single();
 
@@ -424,28 +420,40 @@ export class AuthService {
    */
   async isUsernameAvailable(username) {
     try {
+      console.log(`Checking username availability for: "${username}"`);
+      
+      // First validate the username format and reserved names
       this.validateUsername(username);
+      console.log('Username validation passed');
 
+      // Then check if it exists in the database
       const { data, error } = await this.supabase
-        .from('profiles')
+        .from('users')
         .select('username')
         .eq('username', username)
         .single();
 
+      console.log('Database query result:', { data, error });
+
       // If no error and data exists, username is taken
       if (!error && data) {
+        console.log('Username found in database - not available');
         return false;
       }
 
       // If error is "No rows found", username is available
       if (error && error.code === 'PGRST116') {
+        console.log('No rows found - username is available');
         return true;
       }
 
-      // For other errors, assume username is not available for safety
+      // For other database errors, log them and assume username is not available for safety
+      console.error('Database error checking username availability:', error);
       return false;
-    } catch (error) {
-      // If validation fails, username is not available
+    } catch (validationError) {
+      // If validation fails (reserved username, invalid format, etc.),
+      // the username is not available due to validation rules
+      console.log('Username validation failed:', validationError.message);
       return false;
     }
   }

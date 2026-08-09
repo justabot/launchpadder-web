@@ -2,26 +2,31 @@
   import { page } from '$app/stores';
   import { onMount } from 'svelte';
   import { browser } from '$app/environment';
-  import { supabase } from '$lib/config/supabase.js';
-  import { goto } from '$app/navigation';
   import MobileNav from '$lib/components/MobileNav.svelte';
   import ThemeToggle from '$lib/components/ThemeToggle.svelte';
   import LanguageSwitcher from '$lib/components/LanguageSwitcher.svelte';
+  import UserDropdown from '$lib/components/UserDropdown.svelte';
   import { themeStore } from '$lib/stores/theme.js';
   import { initI18n, setLocale, getTextDirection } from '$lib/i18n/index.js';
   import { locale, _ } from 'svelte-i18n';
+  import { isAuthenticated, userDisplayInfo, initAuth, clearAuth } from '$lib/stores/auth.js';
+  import { authApi } from '$lib/services/api-client.js';
   import '$lib/styles/themes.css';
   
   export let data;
   
-  let user = null;
-  let loading = true;
   let mobileMenuOpen = false;
 
-  // Initialize i18n system
-  $: if (browser && data?.locale) {
+  // Use reactive stores for authentication state
+  $: authenticated = $isAuthenticated;
+  $: displayInfo = $userDisplayInfo;
+
+  // Initialize i18n system for both server and client
+  $: if (data?.locale) {
     initI18n(data.locale);
-    setLocale(data.locale);
+    if (browser) {
+      setLocale(data.locale);
+    }
   }
 
   // Update document direction when locale changes
@@ -35,29 +40,23 @@
     // Initialize theme system
     themeStore.init();
     
-    // Get initial session
-    const { data: { session } } = await supabase.auth.getSession();
-    user = session?.user ?? null;
-    loading = false;
-
-    // Listen for auth changes
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      async (event, session) => {
-        user = session?.user ?? null;
-        
-        if (event === 'SIGNED_IN') {
-          goto('/dashboard');
-        } else if (event === 'SIGNED_OUT') {
-          goto('/');
-        }
-      }
-    );
-
-    return () => subscription.unsubscribe();
+    // Initialize authentication store
+    initAuth();
   });
 
   async function handleSignOut() {
-    await supabase.auth.signOut();
+    try {
+      // Call logout API
+      await authApi.logout();
+    } catch (error) {
+      console.error('Logout API error:', error);
+      // Continue with logout even if API call fails
+    }
+    
+    // Clear authentication data
+    clearAuth();
+    
+    // Close mobile menu
     mobileMenuOpen = false;
   }
 
@@ -113,13 +112,11 @@
         <a href="/launches" class:active={$page.url.pathname === '/launches'}>{$_('navigation.launches')}</a>
         <a href="/submit" class:active={$page.url.pathname === '/submit'}>{$_('navigation.submit')}</a>
         
-        {#if loading}
-          <div class="loading-spinner"></div>
-        {:else if user}
+        {#if authenticated}
           <a href="/dashboard" class:active={$page.url.pathname === '/dashboard'}>{$_('navigation.dashboard')}</a>
           <LanguageSwitcher variant="dropdown" size="medium" showFlags={true} showLabels={false} />
           <ThemeToggle variant="icon" size="medium" showLabel={false} />
-          <button on:click={handleSignOut} class="btn btn-outline">{$_('navigation.signOut')}</button>
+          <UserDropdown />
         {:else}
           <LanguageSwitcher variant="dropdown" size="medium" showFlags={true} showLabels={false} />
           <ThemeToggle variant="icon" size="medium" showLabel={false} />
@@ -141,8 +138,8 @@
   <!-- Mobile Navigation -->
   <MobileNav
     bind:isOpen={mobileMenuOpen}
-    {user}
-    {loading}
+    user={displayInfo}
+    loading={false}
     on:signout={handleSignOut}
     on:close={closeMobileMenu}
   />

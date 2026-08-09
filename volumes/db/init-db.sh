@@ -1,124 +1,219 @@
 #!/bin/bash
 set -e
 
-# This script initializes the Supabase database with proper environment variable substitution
-echo "Starting Supabase database initialization..."
+echo "Starting robust Supabase database initialization..."
 
-# Create the SQL script with environment variable substitution
-cat > /tmp/init-supabase.sql << EOF
--- Minimal database initialization script for Supabase
--- This script sets up basic roles and schemas needed for Supabase to function
+# Function to safely create extensions
+create_extension_safe() {
+    local ext_name="$1"
+    echo "Creating extension: $ext_name"
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+        DO \$\$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = '$ext_name') THEN
+                CREATE EXTENSION "$ext_name";
+                RAISE NOTICE 'Extension $ext_name created successfully';
+            ELSE
+                RAISE NOTICE 'Extension $ext_name already exists';
+            END IF;
+        EXCEPTION
+            WHEN OTHERS THEN
+                RAISE WARNING 'Failed to create extension $ext_name: %', SQLERRM;
+        END
+        \$\$;
+EOSQL
+}
 
--- First, ensure the postgres superuser exists with the correct password
-DO \$\$
-BEGIN
-    -- Create postgres user if it doesn't exist
-    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'postgres') THEN
-        CREATE ROLE postgres WITH SUPERUSER CREATEDB CREATEROLE LOGIN PASSWORD '${POSTGRES_PASSWORD}';
-        RAISE NOTICE 'Created postgres superuser';
-    ELSE
-        -- Update password for existing postgres user
-        ALTER ROLE postgres WITH PASSWORD '${POSTGRES_PASSWORD}';
-        RAISE NOTICE 'Updated postgres user password';
-    END IF;
-END
-\$\$;
+# Create supabase_admin role FIRST to prevent any reference errors
+echo "Creating supabase_admin role..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+    -- Create supabase_admin role immediately
+    DO \$\$
+    BEGIN
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'supabase_admin') THEN
+            CREATE ROLE supabase_admin NOINHERIT CREATEROLE CREATEDB REPLICATION BYPASSRLS LOGIN PASSWORD '${POSTGRES_PASSWORD}';
+            RAISE NOTICE 'Created supabase_admin role with password';
+        ELSE
+            RAISE NOTICE 'supabase_admin role already exists';
+        END IF;
+    END
+    \$\$;
+EOSQL
 
--- Enable basic extensions that are available in standard PostgreSQL
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+# Create basic extensions using direct SQL (bypassing problematic extension scripts)
+echo "Creating extensions directly..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+    -- Create uuid-ossp extension directly
+    DO \$\$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'uuid-ossp') THEN
+            -- Try to create the extension directly without custom scripts
+            CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA public;
+            RAISE NOTICE 'Extension uuid-ossp created successfully';
+        ELSE
+            RAISE NOTICE 'Extension uuid-ossp already exists';
+        END IF;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE WARNING 'Could not create uuid-ossp extension: %, continuing...', SQLERRM;
+    END
+    \$\$;
 
--- Create basic schemas
-CREATE SCHEMA IF NOT EXISTS auth;
-CREATE SCHEMA IF NOT EXISTS storage;
-CREATE SCHEMA IF NOT EXISTS realtime;
-CREATE SCHEMA IF NOT EXISTS _analytics;
-CREATE SCHEMA IF NOT EXISTS _realtime;
-CREATE SCHEMA IF NOT EXISTS supabase_functions;
+    -- Create pgcrypto extension directly
+    DO \$\$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pgcrypto') THEN
+            -- Try to create the extension directly without custom scripts
+            CREATE EXTENSION IF NOT EXISTS "pgcrypto" WITH SCHEMA public;
+            RAISE NOTICE 'Extension pgcrypto created successfully';
+        ELSE
+            RAISE NOTICE 'Extension pgcrypto already exists';
+        END IF;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE WARNING 'Could not create pgcrypto extension: %, continuing...', SQLERRM;
+    END
+    \$\$;
+EOSQL
 
--- Create essential Supabase roles
-DO \$\$
-BEGIN
-    -- Create basic roles if they don't exist
-    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'anon') THEN
-        CREATE ROLE anon NOLOGIN NOINHERIT;
-        RAISE NOTICE 'Created anon role';
-    END IF;
+# Continue with the rest of the initialization
+echo "Creating schemas and remaining roles..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+    -- Create basic schemas
+    CREATE SCHEMA IF NOT EXISTS auth;
+    CREATE SCHEMA IF NOT EXISTS storage;
+    CREATE SCHEMA IF NOT EXISTS realtime;
+    CREATE SCHEMA IF NOT EXISTS _analytics;
+    CREATE SCHEMA IF NOT EXISTS _realtime;
+    CREATE SCHEMA IF NOT EXISTS _supavisor;
+    CREATE SCHEMA IF NOT EXISTS supabase_functions;
+
+    -- Create remaining roles
+    DO \$\$
+    BEGIN
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'anon') THEN
+            CREATE ROLE anon NOLOGIN NOINHERIT;
+        END IF;
+        
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'authenticated') THEN
+            CREATE ROLE authenticated NOLOGIN NOINHERIT;
+        END IF;
+        
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'service_role') THEN
+            CREATE ROLE service_role NOLOGIN NOINHERIT BYPASSRLS;
+        END IF;
+        
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'authenticator') THEN
+            CREATE ROLE authenticator NOINHERIT LOGIN PASSWORD '${POSTGRES_PASSWORD}';
+        END IF;
+        
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'supabase_auth_admin') THEN
+            CREATE ROLE supabase_auth_admin NOINHERIT CREATEROLE LOGIN PASSWORD '${POSTGRES_PASSWORD}';
+        END IF;
+        
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'supabase_storage_admin') THEN
+            CREATE ROLE supabase_storage_admin NOINHERIT CREATEROLE LOGIN PASSWORD '${POSTGRES_PASSWORD}';
+        END IF;
+        
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'supabase_realtime_admin') THEN
+            CREATE ROLE supabase_realtime_admin NOINHERIT CREATEROLE LOGIN PASSWORD '${POSTGRES_PASSWORD}';
+        END IF;
+        
+        -- Create launch user if it doesn't exist (for migrations)
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'launch') THEN
+            CREATE ROLE launch WITH LOGIN PASSWORD '${POSTGRES_PASSWORD}' SUPERUSER;
+        END IF;
+    END
+    \$\$;
+
+    -- Grant roles
+    GRANT anon TO postgres;
+    GRANT authenticated TO postgres;
+    GRANT service_role TO postgres;
+    GRANT supabase_admin TO postgres;
+    GRANT supabase_auth_admin TO postgres;
+    GRANT supabase_storage_admin TO postgres;
+    GRANT supabase_realtime_admin TO postgres;
+    GRANT authenticator TO postgres;
+    GRANT launch TO postgres;
     
-    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'authenticated') THEN
-        CREATE ROLE authenticated NOLOGIN NOINHERIT;
-        RAISE NOTICE 'Created authenticated role';
-    END IF;
+    GRANT anon TO authenticator;
+    GRANT authenticated TO authenticator;
+    GRANT service_role TO authenticator;
+
+    -- Basic permissions
+    GRANT USAGE ON SCHEMA auth TO anon, authenticated, service_role, launch;
+    GRANT USAGE ON SCHEMA storage TO anon, authenticated, service_role, launch;
+    GRANT USAGE ON SCHEMA realtime TO anon, authenticated, service_role, launch;
+    GRANT ALL ON SCHEMA public TO postgres, anon, authenticated, service_role, launch;
+EOSQL
+
+# Create the _supabase database separately (cannot be done inside a transaction)
+echo "Creating _supabase database..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" -c "CREATE DATABASE \"_supabase\";" 2>/dev/null || echo "_supabase database already exists"
+
+# Set up _supabase database with proper schemas and permissions
+echo "Setting up _supabase database schemas..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "_supabase" <<-EOSQL
+    -- Create extensions
+    CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+    CREATE EXTENSION IF NOT EXISTS "pgcrypto";
     
-    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'service_role') THEN
-        CREATE ROLE service_role NOLOGIN NOINHERIT BYPASSRLS;
-        RAISE NOTICE 'Created service_role';
-    END IF;
+    -- Create necessary schemas in _supabase database
+    CREATE SCHEMA IF NOT EXISTS "_supavisor";
+    CREATE SCHEMA IF NOT EXISTS "_analytics";
+    CREATE SCHEMA IF NOT EXISTS "public";
+    CREATE SCHEMA IF NOT EXISTS "auth";
+    CREATE SCHEMA IF NOT EXISTS "storage";
+    CREATE SCHEMA IF NOT EXISTS "realtime";
+    CREATE SCHEMA IF NOT EXISTS "_realtime";
+    CREATE SCHEMA IF NOT EXISTS "supabase_functions";
     
-    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'authenticator') THEN
-        CREATE ROLE authenticator NOINHERIT LOGIN PASSWORD '${POSTGRES_PASSWORD}';
-        RAISE NOTICE 'Created authenticator role';
-    END IF;
+    -- Create roles if they don't exist
+    DO \$\$
+    BEGIN
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'supabase_admin') THEN
+            CREATE ROLE supabase_admin NOINHERIT CREATEROLE CREATEDB REPLICATION BYPASSRLS;
+        END IF;
+        
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'anon') THEN
+            CREATE ROLE anon NOLOGIN NOINHERIT;
+        END IF;
+        
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'authenticated') THEN
+            CREATE ROLE authenticated NOLOGIN NOINHERIT;
+        END IF;
+        
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'service_role') THEN
+            CREATE ROLE service_role NOLOGIN NOINHERIT BYPASSRLS;
+        END IF;
+        
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'authenticator') THEN
+            CREATE ROLE authenticator NOINHERIT LOGIN PASSWORD '$POSTGRES_PASSWORD';
+        END IF;
+    END
+    \$\$;
     
-    IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'supabase_admin') THEN
-        CREATE ROLE supabase_admin NOINHERIT CREATEROLE CREATEDB REPLICATION BYPASSRLS;
-        RAISE NOTICE 'Created supabase_admin role';
-    END IF;
-END
-\$\$;
+    -- Grant permissions to necessary roles
+    GRANT ALL ON SCHEMA "_supavisor" TO postgres, supabase_admin;
+    GRANT ALL ON SCHEMA "_analytics" TO postgres, supabase_admin;
+    GRANT ALL ON SCHEMA "public" TO postgres, supabase_admin, anon, authenticated, service_role;
+    GRANT ALL ON SCHEMA "auth" TO postgres, supabase_admin;
+    GRANT ALL ON SCHEMA "storage" TO postgres, supabase_admin;
+    GRANT ALL ON SCHEMA "realtime" TO postgres, supabase_admin;
+    GRANT ALL ON SCHEMA "_realtime" TO postgres, supabase_admin;
+    GRANT ALL ON SCHEMA "supabase_functions" TO postgres, supabase_admin;
+    
+    -- Grant roles
+    GRANT anon TO postgres;
+    GRANT authenticated TO postgres;
+    GRANT service_role TO postgres;
+    GRANT supabase_admin TO postgres;
+    GRANT authenticator TO postgres;
+    
+    GRANT anon TO authenticator;
+    GRANT authenticated TO authenticator;
+    GRANT service_role TO authenticator;
+EOSQL
 
--- Create the _supabase database for Supavisor connection pooler
-CREATE DATABASE "_supabase" WITH OWNER = postgres;
-
--- Grant basic roles to postgres
-GRANT anon TO postgres;
-GRANT authenticated TO postgres;
-GRANT service_role TO postgres;
-GRANT supabase_admin TO postgres;
-GRANT authenticator TO postgres;
-
--- Grant roles to authenticator
-GRANT anon TO authenticator;
-GRANT authenticated TO authenticator;
-GRANT service_role TO authenticator;
-
--- Grant basic schema permissions
-GRANT USAGE ON SCHEMA auth TO anon, authenticated, service_role;
-GRANT USAGE ON SCHEMA storage TO anon, authenticated, service_role;
-GRANT USAGE ON SCHEMA realtime TO anon, authenticated, service_role;
-GRANT ALL ON SCHEMA public TO postgres, anon, authenticated, service_role;
-
--- Set default privileges
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO postgres, anon, authenticated, service_role;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO postgres, anon, authenticated, service_role;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO postgres, anon, authenticated, service_role;
-
--- Create a simple status table
-CREATE TABLE IF NOT EXISTS public.supabase_init_status (
-    id serial PRIMARY KEY,
-    component text NOT NULL UNIQUE,
-    initialized_at timestamp with time zone DEFAULT now(),
-    version text
-);
-
--- Mark database as initialized
-INSERT INTO public.supabase_init_status (component, version)
-VALUES ('database', '1.0.0')
-ON CONFLICT (component) DO UPDATE SET
-    initialized_at = now(),
-    version = EXCLUDED.version;
-
--- Log successful initialization
-DO \$\$
-BEGIN
-    RAISE NOTICE 'Basic Supabase database initialization completed successfully';
-    RAISE NOTICE 'Created _supabase database for connection pooler';
-END
-\$\$;
-EOF
-
-# Execute the SQL script
-echo "Executing database initialization script..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" -f /tmp/init-supabase.sql
-
-echo "Database initialization completed successfully!"
+echo "✅ Supabase database initialization completed successfully!"
